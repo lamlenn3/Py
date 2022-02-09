@@ -1,0 +1,112 @@
+""" GCP connector using GCP Python Client. """
+
+import json, logging, os, urllib.parse, xml.etree.ElementTree
+from google.cloud import compute
+from googleapiclient import discovery
+import collector.__main__ as __main__
+import collector.util.secrets as secrets, collector.util.retry as retry
+from . import constants
+
+# Globals
+logger = __main__.logger
+gcp_api_key = None
+release_note_entries = None
+sql_full_versions = {}
+
+# Constants
+SQL_ENGINE_NAMES = { "MYSQL": "MySQL", "POSTGRES": "PostgreSQL", "SQLSERVER": "SQL Server" }
+URL_RELEASE_NOTES = "https://cloud.google.com/feeds/cloud-sql-release-notes.xml"
+
+# Public functions
+def get_projects():
+    """ Returns dict of name and project-id pairs. """
+    return constants.PROJECTS
+
+@retry.retry(Exception)
+def get_sql_instances(project_id):
+    """ Returns cloud sql instances in the provided project id and zone id. """
+    _init_config()
+    logger.debug(f"Retrieving cloud sql instances for project_id: {project_id} ...")
+    service = discovery.build('sqladmin', 'v1beta4')
+    request = service.instances().list(project=project_id)
+    response = request.execute()
+    # Decorate
+    if "items" in response:
+        for instance in response["items"]:
+            engine = SQL_ENGINE_NAMES[instance["databaseVersion"][0: instance["databaseVersion"].index("_")]]
+            major_minor = instance["databaseVersion"][instance["databaseVersion"].index("_") + 1:].replace("_", ".")
+            instance["engine_name"] = f"{engine} {major_minor}"
+            instance["engine_version"] = _get_sql_full_version_from_release_notes(engine, major_minor)
+    return response["items"] if "items" in response else []
+
+@retry.retry(Exception)
+def get_vm_instances(project_id, zone_id):
+    """ Returns non-terminated compute instances in the provided project id and zone id. """
+    _init_config()
+    logger.debug(f"Retrieving compute instances for project_id: {project_id}, zone_id: {zone_id} ...")
+    client = compute.InstancesClient()
+    request = compute.ListInstancesRequest(filter="status != TERMINATED", project=project_id, zone=zone_id, max_results=100)
+    pager = client.list(request)
+    instances = pager.items
+    if pager.next_page_token:
+        request.page_token = pager.next_page_token
+        pager = client.list(request)
+        instances.extend(pager.items)
+    return instances
+
+def get_zones():
+    """ Returns sequence of zone ids. """
+    return constants.ZONE_IDS
+
+# Private functions
+def _get_sql_full_version_from_release_notes(engine, major_minor):
+    engine_major_minor = f"{engine} {major_minor}"
+    global sql_full_versions
+    if not engine_major_minor in sql_full_versions:
+        for entry in _get_sql_release_notes_entries():
+            if f"Cloud SQL for {engine}" in entry and " is upgraded to " in entry and major_minor in entry:
+                sub = entry[entry.index(major_minor):]
+                sub_parts = sub[:sub.index("</li>")].split(" ")
+                full_version = sub_parts[len(sub_parts) - 1]
+                if full_version.endswith("."):
+                    full_version = full_version[:len(full_version) - 1]
+                sql_full_versions[engine_major_minor] = full_version
+        logger.debug(f"[gcp_api] Found {engine} version {full_version}")
+    return sql_full_versions[engine_major_minor]
+
+@retry.retry(urllib.error.URLError)
+def _get_sql_release_notes_entries():
+    """ Retrieves release note XML, parses for /entry/content, and returns the text as a list """
+    global release_note_entries
+    if not release_note_entries:
+        request = urllib.request.Request(URL_RELEASE_NOTES, method="GET")
+        logger.debug(f"[gcp_api] Requesting url={request.full_url} ...")
+        response = urllib.request.urlopen(request)
+        root = xml.etree.ElementTree.fromstring(response.read())
+        release_note_entries = []
+        for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
+            content = entry.find("{http://www.w3.org/2005/Atom}content")
+            release_note_entries.append(content.text)
+    return release_note_entries
+
+def _init_config():
+    global gcp_api_key
+    if not gcp_api_key:
+        secret_id = __main__.MAIN_SECRET_ID
+        raw_secret = secrets.get_secret_value(secret_id, "GcpApiKey")
+        transformed_secret = "{" + raw_secret.replace("'", "\"") + "}"
+        gcp_api_key = json.loads(transformed_secret)
+        private_key = ""
+        for key_part in gcp_api_key["private_key"].split("--nl"):
+            if len(private_key) > 0:
+                private_key += "\n"
+            private_key += key_part
+        gcp_api_key["private_key"] = private_key
+        gcp_api_key["client_x509_cert_url"] = gcp_api_key["client_x509_cert_url"].replace("@", "%40")
+        try:
+            stream = open(constants.CREDS_FILE, "w")
+            json.dump(gcp_api_key, stream)
+        finally:
+            stream.close()
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = constants.CREDS_FILE
+        logger.debug(f'[gcp_api] Retrieved gcp config from id={secret_id}: key client_x509_cert_url: {gcp_api_key["client_x509_cert_url"]}, client_email: {gcp_api_key["client_email"]}')
